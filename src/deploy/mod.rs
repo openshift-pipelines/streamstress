@@ -72,6 +72,22 @@ pub fn run_deploy(
     progress::finish_spinner(&pb, true);
     eprintln!("  Patched {}/{} with {} IMAGE_ env vars", namespace, deployment_name, mappings.len());
 
+    // Step 7a: Verify the env vars persisted (detect OLM revert)
+    let pb = progress::stage_spinner("Verifying Deployment env vars persisted");
+    let env_ok = operator::verify_deployment_env(&rt, &client, &namespace, &deployment_name, &mappings)?;
+    progress::finish_spinner(&pb, env_ok);
+    if !env_ok {
+        anyhow::bail!(
+            "Deployment env vars were reverted (possibly by OLM). \
+             Cannot proceed — operator would reconcile with old images."
+        );
+    }
+
+    // Step 7b: Restart operator pod so it picks up updated env vars
+    let pb = progress::stage_spinner("Restarting operator pod");
+    operator::restart_operator_pod(&rt, &client, &namespace, &deployment_name)?;
+    progress::finish_spinner(&pb, true);
+
     // Step 8: Ensure image-pull RBAC for upstream namespace
     let image_namespace = internal_registry
         .rsplit('/')

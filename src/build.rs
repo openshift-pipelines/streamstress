@@ -10,6 +10,66 @@ use crate::exec;
 use crate::progress;
 use crate::registry;
 
+/// Safe base image to replace restricted ghcr.io/tektoncd/ images in .ko.yaml.
+/// Chainguard static is a minimal, publicly available base image suitable for Go binaries.
+const KO_SAFE_BASE_IMAGE: &str = "cgr.dev/chainguard/static:latest";
+
+/// Sanitize `.ko.yaml` in the given source directory by replacing restricted base images.
+///
+/// Upstream Tekton repos reference `ghcr.io/tektoncd/` base images in `.ko.yaml`
+/// which return DENIED when pulled outside the Tekton CI. This function replaces
+/// those references with a publicly available alternative so `ko build` succeeds.
+///
+/// No-op if `.ko.yaml` doesn't exist (not all components have one).
+pub fn sanitize_ko_config(source_dir: &Path) -> Result<()> {
+    let ko_yaml_path = source_dir.join(".ko.yaml");
+    if !ko_yaml_path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&ko_yaml_path)
+        .with_context(|| format!("Failed to read {}", ko_yaml_path.display()))?;
+
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", ko_yaml_path.display()))?;
+
+    let mut replaced = 0u32;
+
+    // Replace defaultBaseImage if it references ghcr.io/tektoncd/
+    if let Some(default_base) = doc.get_mut("defaultBaseImage") {
+        if let Some(s) = default_base.as_str() {
+            if s.starts_with("ghcr.io/tektoncd/") {
+                *default_base = serde_yaml::Value::String(KO_SAFE_BASE_IMAGE.to_string());
+                replaced += 1;
+            }
+        }
+    }
+
+    // Replace baseImageOverrides values that reference ghcr.io/tektoncd/
+    if let Some(overrides) = doc.get_mut("baseImageOverrides") {
+        if let Some(mapping) = overrides.as_mapping_mut() {
+            for (_key, value) in mapping.iter_mut() {
+                if let Some(s) = value.as_str() {
+                    if s.starts_with("ghcr.io/tektoncd/") {
+                        *value = serde_yaml::Value::String(KO_SAFE_BASE_IMAGE.to_string());
+                        replaced += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if replaced > 0 {
+        let patched = serde_yaml::to_string(&doc)
+            .with_context(|| "Failed to serialize patched .ko.yaml")?;
+        std::fs::write(&ko_yaml_path, patched)
+            .with_context(|| format!("Failed to write {}", ko_yaml_path.display()))?;
+        eprintln!("  Sanitized .ko.yaml: replaced {} restricted base image(s)", replaced);
+    }
+
+    Ok(())
+}
+
 /// Build a component and return a HashMap of IMAGE_ env var -> SHA-pinned pullspec.
 ///
 /// This function:
@@ -39,6 +99,9 @@ pub fn run_build_with_refs(
     // Clone with git ref
     eprintln!("  Cloning {} (ref: {})...", comp_cfg.repo, git_ref.as_deref().unwrap_or("HEAD"));
     component::clone_with_ref(&comp_cfg.repo, temp_dir.path(), git_ref.as_deref())?;
+
+    // Sanitize .ko.yaml to replace restricted base images
+    sanitize_ko_config(temp_dir.path())?;
 
     // Get internal registry for building (ko pushes here)
     let internal_registry = registry::get_registry_route()
@@ -331,6 +394,12 @@ pub async fn build_components_parallel(
                     pb.finish_with_message(format!("{comp_name}: FAILED - join error"));
                     return (comp_name, Err(anyhow::anyhow!("join error: {e}")));
                 }
+            }
+
+            // Sanitize .ko.yaml to replace restricted base images
+            if let Err(e) = sanitize_ko_config(temp_dir.path()) {
+                pb.finish_with_message(format!("{comp_name}: FAILED - {e}"));
+                return (comp_name, Err(e));
             }
 
             // Build

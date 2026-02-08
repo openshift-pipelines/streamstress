@@ -691,6 +691,7 @@ fn run_build(component: &str, external_registry: Option<&str>) -> anyhow::Result
     let temp_dir = tempfile::tempdir()?;
     let repo_url = format!("https://github.com/tektoncd/{}.git", component);
     build::clone_repo(&repo_url, temp_dir.path())?;
+    build::sanitize_ko_config(temp_dir.path())?;
     progress::finish_spinner(&pb, true);
 
     // Stage 3: Build images with ko

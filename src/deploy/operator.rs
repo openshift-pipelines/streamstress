@@ -1,6 +1,7 @@
 use anyhow::{bail, Context};
 use k8s_openapi::api::apps::v1::Deployment;
-use kube::api::{Api, ApiResource, DynamicObject, ListParams};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams};
 use kube::Client;
 use serde_json::json;
 use tokio::runtime::Runtime;
@@ -281,4 +282,177 @@ pub fn ensure_image_pull_rbac(
     eprintln!("  Granted image-puller to all authenticated users in {}", image_namespace);
 
     Ok(())
+}
+
+/// Check if a Pod is Running and has the Ready condition set to True.
+fn is_pod_ready(pod: &Pod) -> bool {
+    let phase = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .unwrap_or("");
+    if phase != "Running" {
+        return false;
+    }
+
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
+        })
+        .unwrap_or(false)
+}
+
+/// Verify that the Deployment's env vars match the expected mappings.
+///
+/// Reads back the Deployment and checks that the `openshift-pipelines-operator-lifecycle`
+/// container has the expected IMAGE_ env vars with the correct values.
+/// Returns `false` if OLM reverted the patch (env vars don't match).
+pub fn verify_deployment_env(
+    rt: &Runtime,
+    client: &Client,
+    namespace: &str,
+    deployment_name: &str,
+    mappings: &[(String, String)],
+) -> anyhow::Result<bool> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let dep = rt
+        .block_on(api.get(deployment_name))
+        .with_context(|| format!("Failed to re-read Deployment {}/{}", namespace, deployment_name))?;
+
+    let containers = dep
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|s| &s.containers);
+
+    let container = containers.and_then(|cs| {
+        cs.iter()
+            .find(|c| c.name == "openshift-pipelines-operator-lifecycle")
+    });
+
+    let container = match container {
+        Some(c) => c,
+        None => {
+            eprintln!("  WARNING: lifecycle container not found during verify");
+            return Ok(false);
+        }
+    };
+
+    let envs = container.env.as_deref().unwrap_or(&[]);
+
+    for (key, expected_val) in mappings {
+        let found = envs.iter().find(|e| &e.name == key);
+        match found {
+            Some(env) if env.value.as_deref() == Some(expected_val) => {}
+            Some(env) => {
+                eprintln!(
+                    "  Env var {} mismatch: expected {}, got {:?}",
+                    key,
+                    expected_val,
+                    env.value
+                );
+                return Ok(false);
+            }
+            None => {
+                eprintln!("  Env var {} not found in Deployment", key);
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// Restart the operator pod by deleting existing pods and waiting for a new Ready pod.
+///
+/// After patching the Deployment's env vars, the running pod may still use cached values.
+/// This function deletes matching pods so the Deployment controller creates fresh ones
+/// with the updated environment.
+pub fn restart_operator_pod(
+    rt: &Runtime,
+    client: &Client,
+    namespace: &str,
+    deployment_name: &str,
+) -> anyhow::Result<()> {
+    let dep_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let dep = rt
+        .block_on(dep_api.get(deployment_name))
+        .with_context(|| format!("Failed to get Deployment {}/{}", namespace, deployment_name))?;
+
+    // Build label selector from Deployment's spec.selector.matchLabels
+    let match_labels = dep
+        .spec
+        .as_ref()
+        .and_then(|s| s.selector.match_labels.as_ref())
+        .context("Deployment has no spec.selector.matchLabels")?;
+
+    let label_selector = match_labels
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // List and delete matching pods
+    let pod_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let lp = ListParams::default().labels(&label_selector);
+    let pods = rt
+        .block_on(pod_api.list(&lp))
+        .with_context(|| "Failed to list operator pods")?;
+
+    let old_pod_names: Vec<String> = pods
+        .items
+        .iter()
+        .filter_map(|p| p.metadata.name.clone())
+        .collect();
+
+    if old_pod_names.is_empty() {
+        eprintln!("  No operator pods found to restart");
+        return Ok(());
+    }
+
+    for name in &old_pod_names {
+        eprintln!("  Deleting operator pod: {}", name);
+        let dp = DeleteParams::default();
+        if let Err(e) = rt.block_on(pod_api.delete(name, &dp)) {
+            eprintln!("  WARNING: Failed to delete pod {}: {}", name, e);
+        }
+    }
+
+    // Poll for a new Ready pod (5s interval, 180s timeout)
+    let poll_interval = std::time::Duration::from_secs(5);
+    let timeout = std::time::Duration::from_secs(180);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            bail!(
+                "Timed out waiting for new operator pod to become Ready ({}s)",
+                timeout.as_secs()
+            );
+        }
+
+        std::thread::sleep(poll_interval);
+
+        let pods = rt
+            .block_on(pod_api.list(&lp))
+            .unwrap_or_else(|_| kube::api::ObjectList {
+                metadata: Default::default(),
+                items: vec![],
+                types: Default::default(),
+            });
+
+        // Look for a new pod (not in old_pod_names) that is Ready
+        for pod in &pods.items {
+            if let Some(name) = &pod.metadata.name {
+                if !old_pod_names.contains(name) && is_pod_ready(pod) {
+                    eprintln!("  Operator pod restarted: {} is Running + Ready", name);
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
