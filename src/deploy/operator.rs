@@ -437,13 +437,13 @@ pub fn restart_operator_pod(
 
         std::thread::sleep(poll_interval);
 
-        let pods = rt
-            .block_on(pod_api.list(&lp))
-            .unwrap_or_else(|_| kube::api::ObjectList {
-                metadata: Default::default(),
-                items: vec![],
-                types: Default::default(),
-            });
+        let pods = match rt.block_on(pod_api.list(&lp)) {
+            Ok(list) => list,
+            Err(e) => {
+                eprintln!("  WARNING: Failed to list pods (retrying): {}", e);
+                continue;
+            }
+        };
 
         // Look for a new pod (not in old_pod_names) that is Ready
         for pod in &pods.items {

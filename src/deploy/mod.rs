@@ -72,7 +72,13 @@ pub fn run_deploy(
     progress::finish_spinner(&pb, true);
     eprintln!("  Patched {}/{} with {} IMAGE_ env vars", namespace, deployment_name, mappings.len());
 
-    // Step 7a: Verify the env vars persisted (detect OLM revert)
+    // Step 8: Restart operator pod so it picks up updated env vars
+    let pb = progress::stage_spinner("Restarting operator pod");
+    operator::restart_operator_pod(&rt, &client, &namespace, &deployment_name)?;
+    progress::finish_spinner(&pb, true);
+
+    // Step 8a: Verify env vars persisted AFTER restart (detect OLM revert)
+    // Must happen after restart — OLM could revert between patch and restart
     let pb = progress::stage_spinner("Verifying Deployment env vars persisted");
     let env_ok = operator::verify_deployment_env(&rt, &client, &namespace, &deployment_name, &mappings)?;
     progress::finish_spinner(&pb, env_ok);
@@ -83,12 +89,7 @@ pub fn run_deploy(
         );
     }
 
-    // Step 7b: Restart operator pod so it picks up updated env vars
-    let pb = progress::stage_spinner("Restarting operator pod");
-    operator::restart_operator_pod(&rt, &client, &namespace, &deployment_name)?;
-    progress::finish_spinner(&pb, true);
-
-    // Step 8: Ensure image-pull RBAC for upstream namespace
+    // Step 9: Ensure image-pull RBAC for upstream namespace
     let image_namespace = internal_registry
         .rsplit('/')
         .next()
@@ -97,7 +98,7 @@ pub fn run_deploy(
     operator::ensure_image_pull_rbac(&rt, &client, image_namespace)?;
     progress::finish_spinner(&pb, true);
 
-    // Step 9: Delete InstallerSets to force operator re-reconciliation with new images
+    // Step 10: Delete InstallerSets to force operator re-reconciliation with new images
     let pb = progress::stage_spinner("Deleting InstallerSets to trigger re-reconciliation");
     let prefix = config.components.get(component)
         .and_then(|c| c.installer_set_prefix.as_deref());
@@ -105,7 +106,7 @@ pub fn run_deploy(
     progress::finish_spinner(&pb, true);
     eprintln!("  Deleted {} InstallerSets — operator will recreate with upstream images", deleted);
 
-    // Step 9: Wait for reconciliation (failure is a warning, not fatal)
+    // Step 11: Wait for reconciliation (failure is a warning, not fatal)
     eprintln!();
     match wait::wait_for_reconciliation(&rt, &client, &mappings, _verbose) {
         Ok(()) => {
