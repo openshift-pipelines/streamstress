@@ -155,14 +155,14 @@ for RESULTS_FILE in "${RESULTS_FILES[@]}"; do
            --argjson failed "$FAILED" \
            --arg file "$RUN_FILE" \
            '.runs += [{
-             id: $id,
-             date: $date,
-             timestamp: $date,
-             label: $label,
-             total: $total,
-             passed: $passed,
-             failed: $failed,
-             file: $file
+             "id": $id,
+             "date": $date,
+             "timestamp": $date,
+             "label": $label,
+             "total": $total,
+             "passed": $passed,
+             "failed": $failed,
+             "file": $file
            }]' runs/manifest.json > runs/manifest.json.tmp
         mv runs/manifest.json.tmp runs/manifest.json
     else
